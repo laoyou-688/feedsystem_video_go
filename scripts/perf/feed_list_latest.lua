@@ -1,5 +1,9 @@
 wrk.method = "POST"
-wrk.body   = '{"limit":10}'
+local limit = os.getenv("LIMIT")
+if limit == nil or limit == "" then
+  limit = "10"
+end
+wrk.body   = string.format('{"limit":%s}', limit)
 wrk.headers["Content-Type"] = "application/json"
 wrk.headers["X-Feed-Session"] = "perf-session-001"
 
