@@ -10,6 +10,7 @@ import (
 	"log"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +36,15 @@ const (
 	feedSortLatest = "latest"
 	feedSortHybrid = "hybrid"
 
+	feedSourceModeAuto     = "auto"
+	feedSourceModeTimeline = "timeline"
+	feedSourceModeMySQL    = "mysql"
+
+	feedEntityCacheModeAuto  = "auto"
+	feedEntityCacheModeLocal = "local"
+	feedEntityCacheModeRedis = "redis"
+	feedEntityCacheModeMySQL = "mysql"
+
 	globalTimelineKey       = "feed:global_timeline"
 	timelineRebuildLimit    = 1000
 	followingTimelineTTL    = 6 * time.Hour
@@ -45,6 +55,9 @@ const (
 )
 
 var exposureBloomSeeds = [...]string{"17", "31", "53", "97"}
+
+type feedSourceModeKey struct{}
+type feedEntityCacheModeKey struct{}
 
 type CachedFeedData struct {
 	PublicVideos []video.Video `json:"public_videos"`
@@ -85,17 +98,24 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 		return []*video.Video{}, nil
 	}
 
+	entityMode, _ := ctx.Value(feedEntityCacheModeKey{}).(string)
+	entityMode = normalizeFeedEntityCacheMode(entityMode)
+
 	videoMap := make(map[uint]*video.Video)
 	var missedL1 []uint
-	for _, id := range videoIDs {
-		cacheKey := localcache.VideoEntityKey(id)
-		if v, found := localcache.Get(localcache.NamespaceVideoEntity, cacheKey); found {
-			if data, ok := v.(video.Video); ok {
-				videoMap[id] = &data
-				continue
+	if entityMode != feedEntityCacheModeMySQL && entityMode != feedEntityCacheModeRedis {
+		for _, id := range videoIDs {
+			cacheKey := localcache.VideoEntityKey(id)
+			if v, found := localcache.Get(localcache.NamespaceVideoEntity, cacheKey); found {
+				if data, ok := v.(video.Video); ok {
+					videoMap[id] = &data
+					continue
+				}
 			}
+			missedL1 = append(missedL1, id)
 		}
-		missedL1 = append(missedL1, id)
+	} else {
+		missedL1 = append(missedL1, videoIDs...)
 	}
 
 	if len(missedL1) == 0 {
@@ -103,7 +123,7 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 	}
 
 	var missedL2 []uint
-	if len(missedL1) > 0 && f.rediscache != nil {
+	if len(missedL1) > 0 && f.rediscache != nil && entityMode != feedEntityCacheModeMySQL && entityMode != feedEntityCacheModeLocal {
 		cacheKeys := make([]string, len(missedL1))
 		for i, id := range missedL1 {
 			cacheKeys[i] = fmt.Sprintf("video:entity:%d", id)
@@ -121,7 +141,9 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 						var v video.Video
 						if err := json.Unmarshal([]byte(str), &v); err == nil {
 							videoMap[id] = &v
-							localcache.Set(localcache.NamespaceVideoEntity, localcache.VideoEntityKey(id), v, 5*time.Second)
+							if entityMode == feedEntityCacheModeAuto {
+								localcache.Set(localcache.NamespaceVideoEntity, localcache.VideoEntityKey(id), v, 5*time.Second)
+							}
 							continue
 						}
 					}
@@ -157,7 +179,7 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 
 				safeCopy := *videoList[0]
 				cacheKey := fmt.Sprintf("video:entity:%d", safeCopy.ID)
-				if f.rediscache != nil {
+				if f.rediscache != nil && entityMode != feedEntityCacheModeMySQL && entityMode != feedEntityCacheModeLocal {
 					if b, err := json.Marshal(safeCopy); err == nil {
 						go func(k string, payload []byte) {
 							setCtx, setCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -174,7 +196,9 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 				mu.Lock()
 				videoMap[id] = &safeCopy
 				mu.Unlock()
-				localcache.Set(localcache.NamespaceVideoEntity, localcache.VideoEntityKey(safeCopy.ID), safeCopy, 5*time.Second)
+				if entityMode != feedEntityCacheModeRedis && entityMode != feedEntityCacheModeMySQL {
+					localcache.Set(localcache.NamespaceVideoEntity, localcache.VideoEntityKey(safeCopy.ID), safeCopy, 5*time.Second)
+				}
 			}
 		}(id)
 	}
@@ -188,7 +212,21 @@ func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore ti
 	fetchLimit := candidateLimit(limit)
 	cursor := buildFeedTimeCursor(latestBefore, latestIDBefore)
 
-	baseVideos, nextCursor, err := f.loadLatestCandidates(ctx, fetchLimit, cursor)
+	sourceMode, _ := ctx.Value(feedSourceModeKey{}).(string)
+	sourceMode = normalizeFeedSourceMode(sourceMode)
+
+	var (
+		baseVideos []*video.Video
+		nextCursor *feedTimeCursor
+		err        error
+	)
+	switch sourceMode {
+	case feedSourceModeMySQL:
+		baseVideos, err = f.repo.ListLatest(ctx, fetchLimit, cursorTime(cursor), cursorID(cursor))
+		nextCursor = nextCursorFromVideos(baseVideos)
+	default:
+		baseVideos, nextCursor, err = f.loadLatestCandidates(ctx, fetchLimit, cursor)
+	}
 	if err != nil {
 		return ListLatestResponse{}, err
 	}
@@ -558,6 +596,38 @@ func normalizeFeedSortMode(mode string) string {
 	default:
 		return feedSortLatest
 	}
+}
+
+func normalizeFeedSourceMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case feedSourceModeTimeline:
+		return feedSourceModeTimeline
+	case feedSourceModeMySQL:
+		return feedSourceModeMySQL
+	default:
+		return feedSourceModeAuto
+	}
+}
+
+func normalizeFeedEntityCacheMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case feedEntityCacheModeLocal:
+		return feedEntityCacheModeLocal
+	case feedEntityCacheModeRedis:
+		return feedEntityCacheModeRedis
+	case feedEntityCacheModeMySQL:
+		return feedEntityCacheModeMySQL
+	default:
+		return feedEntityCacheModeAuto
+	}
+}
+
+func WithFeedSourceMode(ctx context.Context, mode string) context.Context {
+	return context.WithValue(ctx, feedSourceModeKey{}, normalizeFeedSourceMode(mode))
+}
+
+func WithFeedEntityCacheMode(ctx context.Context, mode string) context.Context {
+	return context.WithValue(ctx, feedEntityCacheModeKey{}, normalizeFeedEntityCacheMode(mode))
 }
 
 func candidateLimit(limit int) int {

@@ -102,34 +102,23 @@ npm run dev
 
 ## 压测脚本
 
-仓库内提供了视频详情接口的对比压测脚本，用于验证本地缓存、Redis 与 MySQL 回源三条路径的差异。
+仓库内提供了视频详情接口和 Feed 列表接口的对比压测脚本。
 
-### Linux / macOS
+### 视频详情压测
 
-1. 造压测数据
+Linux / macOS：
 
 ```bash
 HOST=http://127.0.0.1:8080 bash scripts/perf/prepare_perf_data.sh
-```
-
-2. 运行压测
-
-```bash
 VIDEO_ID=<你的video_id> HOST=http://127.0.0.1:8080 bash scripts/perf/run_video_detail_perf.sh
 ```
 
-### Windows PowerShell
-
-1. 造压测数据
+Windows PowerShell：
 
 ```powershell
 $env:HOST = "http://127.0.0.1:8080"
 .\scripts\perf\prepare_perf_data.ps1
-```
 
-2. 运行压测
-
-```powershell
 $env:HOST = "http://127.0.0.1:8080"
 $env:VIDEO_ID = "<你的video_id>"
 .\scripts\perf\run_video_detail_perf.ps1
@@ -143,6 +132,36 @@ $env:THREADS = "8"
 $env:DURATION = "20s"
 $env:WRK_BIN = "wrk.exe"
 ```
+
+### Feed 列表压测
+
+相比单条视频详情，`/feed/listLatest` 更容易体现时间线读取与视频实体缓存的差异。
+
+1. 准备 Feed 压测数据
+
+```bash
+HOST=http://127.0.0.1:8080 VIDEO_COUNT=30 bash scripts/perf/prepare_feed_perf_data.sh
+```
+
+2. 运行 Feed 压测
+
+```bash
+HOST=http://127.0.0.1:8080 bash scripts/perf/run_feed_list_latest_perf.sh
+```
+
+这个脚本会依次压测三种模式：
+
+- `timeline + auto entity cache`
+- `timeline + mysql entity`
+- `mysql + mysql`
+
+含义分别是：
+
+- 第一组：时间线按默认策略读取，视频实体也按默认缓存策略读取
+- 第二组：时间线仍从时间线链路读取，但视频实体强制 MySQL 回源
+- 第三组：时间线与视频实体都强制走 MySQL
+
+这组数据通常比 `video/getDetail` 更容易拉开差距。
 
 ## 性能报告模板
 

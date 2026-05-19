@@ -39,7 +39,9 @@ func (f *FeedHandler) ListLatest(c *gin.Context) {
 	if req.LatestIDBefore != nil {
 		latestIDBefore = *req.LatestIDBefore
 	}
-	feedItems, err := f.service.ListLatest(c.Request.Context(), req.Limit, latestTime, latestIDBefore, viewerAccountID, req.SortMode, viewerKey)
+	ctx := WithFeedSourceMode(c.Request.Context(), c.GetHeader("X-Feed-Source-Mode"))
+	ctx = WithFeedEntityCacheMode(ctx, c.GetHeader("X-Feed-Entity-Cache-Mode"))
+	feedItems, err := f.service.ListLatest(ctx, req.Limit, latestTime, latestIDBefore, viewerAccountID, req.SortMode, viewerKey)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
