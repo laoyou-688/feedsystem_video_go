@@ -1,19 +1,20 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
-	"errors"
+
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	Database DatabaseConfig `yaml:"database"`
-	Redis    RedisConfig    `yaml:"redis"`
-	RabbitMQ RabbitMQConfig `yaml:"rabbitmq"`
-	Canal    CanalConfig    `yaml:"canal"`
-	Feed     FeedConfig     `yaml:"feed"`
+	Server              ServerConfig        `yaml:"server"`
+	Database            DatabaseConfig      `yaml:"database"`
+	Redis               RedisConfig         `yaml:"redis"`
+	RabbitMQ            RabbitMQConfig      `yaml:"rabbitmq"`
+	Canal               CanalConfig         `yaml:"canal"`
+	Feed                FeedConfig          `yaml:"feed"`
 	ObservabilityConfig ObservabilityConfig `yaml:"observability"`
 }
 
@@ -55,13 +56,21 @@ type FeedConfig struct {
 }
 
 type ObservabilityConfig struct {
-	Pprof PprofConfig `yaml:"pprof"`
+	Pprof   PprofConfig   `yaml:"pprof"`
+	Metrics MetricsConfig `yaml:"metrics"`
 }
+
 type PprofConfig struct {
-	Enabled bool `yaml:"enabled"`
-	ApiAddr string `yaml:"api_addr"`
+	Enabled    bool   `yaml:"enabled"`
+	ApiAddr    string `yaml:"api_addr"`
 	WorkerAddr string `yaml:"worker_addr"`
 }
+
+type MetricsConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Path    string `yaml:"path"`
+}
+
 func Load(filename string) (Config, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
@@ -123,9 +132,13 @@ func DefaultLocalConfig() Config {
 		},
 		ObservabilityConfig: ObservabilityConfig{
 			Pprof: PprofConfig{
-				Enabled: true,
-				ApiAddr: "localhost:6060",
+				Enabled:    true,
+				ApiAddr:    "localhost:6060",
 				WorkerAddr: "localhost:6061",
+			},
+			Metrics: MetricsConfig{
+				Enabled: true,
+				Path:    "/metrics",
 			},
 		},
 	}
