@@ -4,17 +4,19 @@ import (
 	"context"
 	"errors"
 	"feedsystem_video_go/internal/account"
-	"feedsystem_video_go/internal/middleware/rabbitmq"
+	"feedsystem_video_go/internal/video"
+	"time"
+
+	"gorm.io/gorm"
 )
 
 type SocialService struct {
 	repo        *SocialRepository
 	accountrepo *account.AccountRepository
-	socialMQ    *rabbitmq.SocialMQ
 }
 
-func NewSocialService(repo *SocialRepository, accountrepo *account.AccountRepository, socialMQ *rabbitmq.SocialMQ) *SocialService {
-	return &SocialService{repo: repo, accountrepo: accountrepo, socialMQ: socialMQ}
+func NewSocialService(repo *SocialRepository, accountrepo *account.AccountRepository) *SocialService {
+	return &SocialService{repo: repo, accountrepo: accountrepo}
 }
 
 func (s *SocialService) Follow(ctx context.Context, social *Social) error {
@@ -36,10 +38,19 @@ func (s *SocialService) Follow(ctx context.Context, social *Social) error {
 	if isFollowed {
 		return errors.New("already followed")
 	}
-	if s.socialMQ != nil {
-		s.socialMQ.Follow(ctx, social.FollowerID, social.VloggerID)
-	}
-	return s.repo.Follow(ctx, social)
+	return s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(social).Error; err != nil {
+			return err
+		}
+		msg := video.OutboxMsg{
+			FollowerID: social.FollowerID,
+			VloggerID:  social.VloggerID,
+			EventType:  "social_follow",
+			Status:     "pending",
+			CreateTime: time.Now(),
+		}
+		return tx.Create(&msg).Error
+	})
 }
 
 func (s *SocialService) Unfollow(ctx context.Context, social *Social) error {
@@ -58,10 +69,23 @@ func (s *SocialService) Unfollow(ctx context.Context, social *Social) error {
 	if !isFollowed {
 		return errors.New("not followed")
 	}
-	if s.socialMQ != nil {
-		s.socialMQ.UnFollow(ctx, social.FollowerID, social.VloggerID)
-	}
-	return s.repo.Unfollow(ctx, social)
+	return s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		del := tx.Where("follower_id = ? AND vlogger_id = ?", social.FollowerID, social.VloggerID).Delete(&Social{})
+		if del.Error != nil {
+			return del.Error
+		}
+		if del.RowsAffected == 0 {
+			return errors.New("not followed")
+		}
+		msg := video.OutboxMsg{
+			FollowerID: social.FollowerID,
+			VloggerID:  social.VloggerID,
+			EventType:  "social_unfollow",
+			Status:     "pending",
+			CreateTime: time.Now(),
+		}
+		return tx.Create(&msg).Error
+	})
 }
 
 func (s *SocialService) GetAllFollowers(ctx context.Context, VloggerID uint) ([]*account.Account, error) {

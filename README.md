@@ -1,54 +1,66 @@
 # Feed System Video Go
 
-基于 Go 的短视频 Feed 系统，包含账号、视频、点赞、评论、关注与 Feed 流等核心能力，支持 Redis 缓存、RabbitMQ 异步 Worker，以及基于 Docker Compose 的一键依赖启动。
+一个基于 Go 的短视频 Feed 系统，包含账号、视频、点赞、评论、关注与信息流能力，并补了缓存、RabbitMQ 异步写、Prometheus 指标、pprof 和 `wrk` 压测脚本，适合作为后端工程项目展示。
 
-## 项目特点
+## Features
 
-- 支持最新流、关注流、热度流等多种 Feed 获取方式
-- 关注流采用基于粉丝规模阈值与活跃窗口的混合分发策略
-- 点赞、评论链路通过 RabbitMQ 异步削峰，Worker 侧异步落库与热度更新
-- 使用本地缓存 + Redis 两级缓存优化热点详情读取
-- 提供 Linux 与 Windows 可运行的压测脚本，可对本地缓存、Redis 与 MySQL 回源路径进行对比
-- 新增 Prometheus 指标暴露与结构化访问日志，便于压测取证和性能报告沉淀
+- 账号：注册、登录、JWT 鉴权、改名、改密
+- 视频：发布、详情、作者视频列表
+- 互动：点赞、取消点赞、评论发布、评论删除
+- 社交：关注、取关、粉丝 / 关注列表
+- Feed：`/feed/listLatest`、`/feed/listByPopularity`、`/feed/listByFollowing`
+- 可观测性：`/metrics`、pprof、请求访问日志
+- 压测：视频详情与 Feed 列表的 `wrk` 脚本
 
-## 技术栈
+## Tech Stack
 
-- 后端：Go、Gin、GORM、MySQL
-- 缓存：Redis、本地缓存
-- 消息队列：RabbitMQ
-- 可观测性：Prometheus 指标、pprof、访问日志
-- 部署：Docker、Docker Compose
-- 压测：wrk、Lua、PowerShell
+- Backend: Go, Gin, GORM
+- Storage: MySQL
+- Cache: Redis, Local Cache
+- MQ: RabbitMQ
+- Frontend: Vue 3, Pinia, Vite
+- Observability: Prometheus, pprof
+- Deploy: Docker Compose
 
-## 目录结构
+## Highlights
 
-```text
-backend/     后端 API、Worker、核心业务逻辑
-frontend/    前端页面与接口调用
-scripts/     压测与辅助脚本
-docs/        性能报告模板与后续文档沉淀
+- 给 API 接入了 Prometheus 指标、请求耗时直方图、in-flight 请求统计和访问日志，方便压测取证
+- 给 `/video/getDetail` 和 `/feed/listLatest` 补了 Linux / Windows 压测脚本，可直接对比缓存与 MySQL 回源差异
+- 评论异步写链路引入 `client_token`，并用 Redis 维护 pending / canceled 状态，解决“先发布再立刻删除”的竞态
+- 关注链路改成 Outbox 模式，降低“主库成功、下游分发失败”带来的一致性问题
+- 点赞链路补了幂等键和异步失败兜底逻辑
+- Feed 读取路径做了批量化和缓存优化，能更稳定拉开不同读路径的性能差异
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Client["Client / Frontend"] --> API["Gin API"]
+    API --> MySQL["MySQL"]
+    API --> Redis["Redis"]
+    API --> MQ["RabbitMQ"]
+    MQ --> Worker["Async Workers"]
+    Worker --> MySQL
+    Worker --> Redis
+    API --> Metrics["/metrics + pprof + Access Log"]
 ```
 
-## 使用 Docker Compose 启动
+## Quick Start
 
-要求：
-- 已安装 Docker
-- 已安装 Docker Compose
-
-在项目根目录执行：
+### Docker Compose
 
 ```bash
 docker compose up -d --build
 ```
 
-启动后默认访问地址：
-- 后端 API：`http://127.0.0.1:8080`
-- 前端页面：`http://127.0.0.1:5173`
-- RabbitMQ 管理台：`http://127.0.0.1:15672`
-- Prometheus 指标：`http://127.0.0.1:8080/metrics`
-- API pprof：按 `backend/configs/config.yaml` 配置
+默认地址：
 
-## 本地开发启动
+- Frontend: `http://127.0.0.1:5173`
+- API: `http://127.0.0.1:8080`
+- Metrics: `http://127.0.0.1:8080/metrics`
+- RabbitMQ Console: `http://127.0.0.1:15672`
+
+### Local Run
 
 先启动依赖：
 
@@ -56,10 +68,11 @@ docker compose up -d --build
 docker compose up -d mysql redis rabbitmq
 ```
 
-启动后端 API：
+启动 API：
 
 ```bash
 cd backend
+go mod download
 go run ./cmd
 ```
 
@@ -70,117 +83,60 @@ cd backend
 go run ./cmd/worker
 ```
 
-启动前端：
+配置文件：
 
-```bash
-cd frontend
-npm install
-npm run dev
-```
+- [backend/configs/config.yaml](backend/configs/config.yaml)
+- [backend/configs/config.docker.yaml](backend/configs/config.docker.yaml)
 
-## 可观测性
+## Pressure Test
 
-当前版本已经内置两类观测能力：
+### Video Detail
 
-1. `pprof`
-
-- API：`backend/configs/config.yaml` 中 `observability.pprof.api_addr`
-- Worker：`backend/configs/config.yaml` 中 `observability.pprof.worker_addr`
-
-2. Prometheus 指标
-
-- 默认路径：`/metrics`
-- 配置项：`observability.metrics.enabled`、`observability.metrics.path`
-
-当前可直接使用的指标包括：
-
-- `feedsystem_http_requests_total`
-- `feedsystem_http_request_duration_seconds`
-- `feedsystem_http_in_flight_requests`
-
-访问日志会按结构化字段输出，适合压测期间结合接口延迟一起分析。
-
-## 压测脚本
-
-仓库内提供了视频详情接口和 Feed 列表接口的对比压测脚本。
-
-### 视频详情压测
-
-Linux / macOS：
+Linux:
 
 ```bash
 HOST=http://127.0.0.1:8080 bash scripts/perf/prepare_perf_data.sh
-VIDEO_ID=<你的video_id> HOST=http://127.0.0.1:8080 bash scripts/perf/run_video_detail_perf.sh
+VIDEO_ID=1 HOST=http://127.0.0.1:8080 bash scripts/perf/run_video_detail_perf.sh
 ```
 
-Windows PowerShell：
+Windows PowerShell:
 
 ```powershell
 $env:HOST = "http://127.0.0.1:8080"
 .\scripts\perf\prepare_perf_data.ps1
 
 $env:HOST = "http://127.0.0.1:8080"
-$env:VIDEO_ID = "<你的video_id>"
+$env:VIDEO_ID = "<your_video_id>"
 .\scripts\perf\run_video_detail_perf.ps1
 ```
 
-可选参数：
-
-```powershell
-$env:CONNECTIONS = "100"
-$env:THREADS = "8"
-$env:DURATION = "20s"
-$env:WRK_BIN = "wrk.exe"
-```
-
-### Feed 列表压测
-
-相比单条视频详情，`/feed/listLatest` 更容易体现时间线读取与视频实体缓存的差异。
-
-1. 准备 Feed 压测数据
+### Feed List
 
 ```bash
 HOST=http://127.0.0.1:8080 VIDEO_COUNT=30 bash scripts/perf/prepare_feed_perf_data.sh
-```
-
-2. 运行 Feed 压测
-
-```bash
 HOST=http://127.0.0.1:8080 bash scripts/perf/run_feed_list_latest_perf.sh
 ```
 
-这个脚本会依次压测三种模式：
+相关文档：
 
-- `timeline + auto entity cache`
-- `timeline + mysql entity`
-- `mysql + mysql`
+- [docs/linux-perf-guide.md](docs/linux-perf-guide.md)
+- [docs/performance-report-template.md](docs/performance-report-template.md)
 
-含义分别是：
+## Project Structure
 
-- 第一组：时间线按默认策略读取，视频实体也按默认缓存策略读取
-- 第二组：时间线仍从时间线链路读取，但视频实体强制 MySQL 回源
-- 第三组：时间线与视频实体都强制走 MySQL
+```text
+.
+├─ backend
+│  ├─ cmd
+│  ├─ configs
+│  └─ internal
+├─ frontend
+├─ scripts
+│  └─ perf
+├─ docs
+└─ docker-compose.yml
+```
 
-这组数据通常比 `video/getDetail` 更容易拉开差距。
+## License
 
-## 性能报告模板
-
-建议把每次压测结果按同一模板记录，方便后续写进简历或面试回答。
-
-- 模板文件：[docs/performance-report-template.md](docs/performance-report-template.md)
-
-建议至少记录：
-
-- 本地缓存 vs Redis vs MySQL 的详情接口对比
-- `/feed/listLatest` 或 `/feed/listByPopularity` 的读路径表现
-- RabbitMQ 正常与降级直写时的写链路差异
-- 关键慢 SQL 与 Redis 命中情况
-
-## 下一步建议
-
-在当前版本基础上，最值得继续补的方向是：
-
-1. 给 Feed 与 Like 链路增加更细粒度的业务指标
-2. 把 Prometheus / Grafana 接入 `docker-compose`
-3. 补 Like 写链路的压测脚本和降级测试
-4. 为热点 SQL 增加索引与 EXPLAIN 对比文档
+MIT

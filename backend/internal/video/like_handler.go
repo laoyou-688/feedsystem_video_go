@@ -32,14 +32,15 @@ func (lh *LikeHandler) Like(c *gin.Context) {
 	}
 
 	like := &Like{
-		VideoID:   req.VideoID,
-		AccountID: accountID,
+		VideoID:     req.VideoID,
+		AccountID:   accountID,
+		ClientToken: req.ClientToken,
 	}
 	if err := lh.service.Like(c.Request.Context(), like); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(200, gin.H{"message": "like success"})
+	c.JSON(200, gin.H{"message": "like success", "client_token": like.ClientToken})
 }
 
 func (lh *LikeHandler) Unlike(c *gin.Context) {
@@ -60,14 +61,15 @@ func (lh *LikeHandler) Unlike(c *gin.Context) {
 	}
 
 	like := &Like{
-		VideoID:   req.VideoID,
-		AccountID: accountID,
+		VideoID:     req.VideoID,
+		AccountID:   accountID,
+		ClientToken: req.ClientToken,
 	}
 	if err := lh.service.Unlike(c.Request.Context(), like); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(200, gin.H{"message": "unlike success"})
+	c.JSON(200, gin.H{"message": "unlike success", "client_token": like.ClientToken})
 }
 
 func (lh *LikeHandler) IsLiked(c *gin.Context) {

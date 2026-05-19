@@ -46,24 +46,6 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ, cf
 	commentLimiter := ratelimit.Limit(cache, "comment_write", 10, time.Minute, ratelimit.KeyByAccount)
 	socialLimiter := ratelimit.Limit(cache, "social_write", 20, time.Minute, ratelimit.KeyByAccount)
 
-	accountRepository := account.NewAccountRepository(db)
-	accountService := account.NewAccountService(accountRepository, cache)
-	accountHandler := account.NewAccountHandler(accountService)
-	accountGroup := r.Group("/account")
-	{
-		accountGroup.POST("/register", registerLimiter, accountHandler.CreateAccount)
-		accountGroup.POST("/login", loginLimiter, accountHandler.Login)
-		accountGroup.POST("/changePassword", accountHandler.ChangePassword)
-		accountGroup.POST("/findByID", accountHandler.FindByID)
-		accountGroup.POST("/findByUsername", accountHandler.FindByUsername)
-	}
-	protectedAccountGroup := accountGroup.Group("")
-	protectedAccountGroup.Use(jwt.JWTAuth(accountRepository, cache))
-	{
-		protectedAccountGroup.POST("/logout", accountHandler.Logout)
-		protectedAccountGroup.POST("/rename", accountHandler.Rename)
-	}
-
 	videoRepository := video.NewVideoRepository(db)
 	popularityMQ, err := rabbitmq.NewPopularityMQ(rmq)
 	if err != nil {
@@ -83,6 +65,25 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ, cf
 			log.Printf("local cache invalidation consumer start failed: %v", err)
 		}
 	}
+
+	accountRepository := account.NewAccountRepository(db)
+	accountService := account.NewAccountService(accountRepository, cache, localCacheMQ)
+	accountHandler := account.NewAccountHandler(accountService)
+	accountGroup := r.Group("/account")
+	{
+		accountGroup.POST("/register", registerLimiter, accountHandler.CreateAccount)
+		accountGroup.POST("/login", loginLimiter, accountHandler.Login)
+		accountGroup.POST("/changePassword", accountHandler.ChangePassword)
+		accountGroup.POST("/findByID", accountHandler.FindByID)
+		accountGroup.POST("/findByUsername", accountHandler.FindByUsername)
+	}
+	protectedAccountGroup := accountGroup.Group("")
+	protectedAccountGroup.Use(jwt.JWTAuth(accountRepository, cache))
+	{
+		protectedAccountGroup.POST("/logout", accountHandler.Logout)
+		protectedAccountGroup.POST("/rename", accountHandler.Rename)
+	}
+
 	videoService := video.NewVideoService(videoRepository, cache, popularityMQ, localCacheMQ)
 	videoHandler := video.NewVideoHandler(videoService, accountService)
 	videoGroup := r.Group("/video")
@@ -135,13 +136,8 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ, cf
 		protectedCommentGroup.POST("/delete", commentLimiter, commentHandler.DeleteComment)
 	}
 
-	socialMQ, err := rabbitmq.NewSocialMQ(rmq)
-	if err != nil {
-		log.Printf("SocialMQ init failed (mq disabled): %v", err)
-		socialMQ = nil
-	}
 	socialRepository := social.NewSocialRepository(db)
-	socialService := social.NewSocialService(socialRepository, accountRepository, socialMQ)
+	socialService := social.NewSocialService(socialRepository, accountRepository)
 	socialHandler := social.NewSocialHandler(socialService)
 	socialGroup := r.Group("/social")
 	protectedSocialGroup := socialGroup.Group("")

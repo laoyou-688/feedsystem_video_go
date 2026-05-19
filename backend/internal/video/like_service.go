@@ -33,6 +33,9 @@ func (s *LikeService) Like(ctx context.Context, like *Like) error {
 	if like == nil {
 		return errors.New("like is nil")
 	}
+	if err := EnsureLikeClientToken(like); err != nil {
+		return err
+	}
 	if like.VideoID == 0 || like.AccountID == 0 {
 		return errors.New("video_id and account_id are required")
 	}
@@ -45,6 +48,13 @@ func (s *LikeService) Like(ctx context.Context, like *Like) error {
 		if !ok {
 			return errors.New("video not found")
 		}
+	}
+	claimed, err := ClaimLikeRequest(ctx, s.cache, "like", like.AccountID, like.VideoID, like.ClientToken)
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		return nil
 	}
 
 	isLiked, err := s.repo.IsLiked(ctx, like.VideoID, like.AccountID)
@@ -111,6 +121,9 @@ func (s *LikeService) Unlike(ctx context.Context, like *Like) error {
 	if like == nil {
 		return errors.New("like is nil")
 	}
+	if err := EnsureLikeClientToken(like); err != nil {
+		return err
+	}
 	if like.VideoID == 0 || like.AccountID == 0 {
 		return errors.New("video_id and account_id are required")
 	}
@@ -123,6 +136,13 @@ func (s *LikeService) Unlike(ctx context.Context, like *Like) error {
 		if !ok {
 			return errors.New("video not found")
 		}
+	}
+	claimed, err := ClaimLikeRequest(ctx, s.cache, "unlike", like.AccountID, like.VideoID, like.ClientToken)
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		return nil
 	}
 
 	isLiked, err := s.repo.IsLiked(ctx, like.VideoID, like.AccountID)

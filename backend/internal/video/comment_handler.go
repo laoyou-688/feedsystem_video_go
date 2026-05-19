@@ -40,16 +40,20 @@ func (h *CommentHandler) PublishComment(c *gin.Context) {
 		return
 	}
 	comment := &Comment{
-		Username: user.Username,
-		VideoID:  req.VideoID,
-		AuthorID: authorId,
-		Content:  req.Content,
+		Username:    user.Username,
+		VideoID:     req.VideoID,
+		AuthorID:    authorId,
+		ClientToken: req.ClientToken,
+		Content:     req.Content,
 	}
 	if err := h.service.Publish(c.Request.Context(), comment); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(200, gin.H{"message": "comment published successfully"})
+	c.JSON(200, gin.H{
+		"message":      "comment published successfully",
+		"client_token": comment.ClientToken,
+	})
 }
 
 func (h *CommentHandler) DeleteComment(c *gin.Context) {
@@ -63,11 +67,11 @@ func (h *CommentHandler) DeleteComment(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	if req.CommentID <= 0 {
-		c.JSON(400, gin.H{"error": "comment_id is required"})
+	if req.CommentID == 0 && req.ClientToken == "" {
+		c.JSON(400, gin.H{"error": "comment_id or client_token is required"})
 		return
 	}
-	if err := h.service.Delete(c.Request.Context(), req.CommentID, accountID); err != nil {
+	if err := h.service.Delete(c.Request.Context(), req.CommentID, req.ClientToken, accountID); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
