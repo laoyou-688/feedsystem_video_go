@@ -10,7 +10,7 @@ import (
 	"log"
 	"sort"
 	"strconv"
-	"sync"
+	"strings"
 	"time"
 
 	"feedsystem_video_go/internal/localcache"
@@ -35,16 +35,28 @@ const (
 	feedSortLatest = "latest"
 	feedSortHybrid = "hybrid"
 
-	globalTimelineKey       = "feed:global_timeline"
-	timelineRebuildLimit    = 1000
-	followingTimelineTTL    = 6 * time.Hour
-	activeViewerZSetKey     = "feed:active_users"
-	activeViewerWindow      = 72 * time.Hour
-	exposureBloomBits int64 = 1 << 18
-	exposureBloomTTL        = 72 * time.Hour
+	feedSourceModeAuto     = "auto"
+	feedSourceModeTimeline = "timeline"
+	feedSourceModeMySQL    = "mysql"
+
+	feedEntityCacheModeAuto  = "auto"
+	feedEntityCacheModeLocal = "local"
+	feedEntityCacheModeRedis = "redis"
+	feedEntityCacheModeMySQL = "mysql"
+
+	globalTimelineKey          = "feed:global_timeline"
+	timelineRebuildLimit       = 1000
+	followingTimelineTTL       = 6 * time.Hour
+	activeViewerZSetKey        = "feed:active_users"
+	activeViewerWindow         = 72 * time.Hour
+	exposureBloomBits    int64 = 1 << 18
+	exposureBloomTTL           = 72 * time.Hour
 )
 
 var exposureBloomSeeds = [...]string{"17", "31", "53", "97"}
+
+type feedSourceModeKey struct{}
+type feedEntityCacheModeKey struct{}
 
 type CachedFeedData struct {
 	PublicVideos []video.Video `json:"public_videos"`
@@ -85,17 +97,24 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 		return []*video.Video{}, nil
 	}
 
+	entityMode, _ := ctx.Value(feedEntityCacheModeKey{}).(string)
+	entityMode = normalizeFeedEntityCacheMode(entityMode)
+
 	videoMap := make(map[uint]*video.Video)
 	var missedL1 []uint
-	for _, id := range videoIDs {
-		cacheKey := localcache.VideoEntityKey(id)
-		if v, found := localcache.Get(localcache.NamespaceVideoEntity, cacheKey); found {
-			if data, ok := v.(video.Video); ok {
-				videoMap[id] = &data
-				continue
+	if entityMode != feedEntityCacheModeMySQL && entityMode != feedEntityCacheModeRedis {
+		for _, id := range videoIDs {
+			cacheKey := localcache.VideoEntityKey(id)
+			if v, found := localcache.Get(localcache.NamespaceVideoEntity, cacheKey); found {
+				if data, ok := v.(video.Video); ok {
+					videoMap[id] = &data
+					continue
+				}
 			}
+			missedL1 = append(missedL1, id)
 		}
-		missedL1 = append(missedL1, id)
+	} else {
+		missedL1 = append(missedL1, videoIDs...)
 	}
 
 	if len(missedL1) == 0 {
@@ -103,7 +122,7 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 	}
 
 	var missedL2 []uint
-	if len(missedL1) > 0 && f.rediscache != nil {
+	if len(missedL1) > 0 && f.rediscache != nil && entityMode != feedEntityCacheModeMySQL && entityMode != feedEntityCacheModeLocal {
 		cacheKeys := make([]string, len(missedL1))
 		for i, id := range missedL1 {
 			cacheKeys[i] = fmt.Sprintf("video:entity:%d", id)
@@ -121,7 +140,9 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 						var v video.Video
 						if err := json.Unmarshal([]byte(str), &v); err == nil {
 							videoMap[id] = &v
-							localcache.Set(localcache.NamespaceVideoEntity, localcache.VideoEntityKey(id), v, 5*time.Second)
+							if entityMode == feedEntityCacheModeAuto {
+								localcache.Set(localcache.NamespaceVideoEntity, localcache.VideoEntityKey(id), v, 5*time.Second)
+							}
 							continue
 						}
 					}
@@ -141,44 +162,51 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 		return buildOrderedResult(videoIDs, videoMap), nil
 	}
 
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	for _, id := range missedL2 {
-		wg.Add(1)
-		go func(videoID uint) {
-			defer wg.Done()
-			sfKey := fmt.Sprintf("sf:entity:%d", videoID)
+	batchIDs := append([]uint(nil), missedL2...)
+	batchKey := buildVideoEntityBatchSingleflightKey(batchIDs)
+	result, err, _ := f.requestGroup.Do(batchKey, func() (interface{}, error) {
+		videoList, err := f.repo.GetByIDs(ctx, batchIDs)
+		if err != nil {
+			return nil, err
+		}
 
-			v, err, _ := f.requestGroup.Do(sfKey, func() (interface{}, error) {
-				videoList, err := f.repo.GetByIDs(ctx, []uint{videoID})
-				if err != nil || len(videoList) == 0 {
-					return nil, err
+		resultMap := make(map[uint]*video.Video, len(videoList))
+		for _, item := range videoList {
+			if item == nil {
+				continue
+			}
+
+			safeCopy := *item
+			resultMap[safeCopy.ID] = &safeCopy
+
+			cacheKey := fmt.Sprintf("video:entity:%d", safeCopy.ID)
+			if f.rediscache != nil && entityMode != feedEntityCacheModeMySQL && entityMode != feedEntityCacheModeLocal {
+				if b, err := json.Marshal(safeCopy); err == nil {
+					go func(k string, payload []byte) {
+						setCtx, setCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+						defer setCancel()
+						_ = f.rediscache.SetBytes(setCtx, k, payload, time.Hour)
+					}(cacheKey, b)
 				}
+			}
+		}
 
-				safeCopy := *videoList[0]
-				cacheKey := fmt.Sprintf("video:entity:%d", safeCopy.ID)
-				if f.rediscache != nil {
-					if b, err := json.Marshal(safeCopy); err == nil {
-						go func(k string, payload []byte) {
-							setCtx, setCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-							defer setCancel()
-							_ = f.rediscache.SetBytes(setCtx, k, payload, time.Hour)
-						}(cacheKey, b)
-					}
-				}
-				return videoList[0], err
-			})
+		return resultMap, nil
+	})
+	if err == nil && result != nil {
+		cachedVideos := result.(map[uint]*video.Video)
+		for id, item := range cachedVideos {
+			if item == nil {
+				continue
+			}
 
-			if err == nil && v != nil {
-				safeCopy := *(v.(*video.Video))
-				mu.Lock()
-				videoMap[id] = &safeCopy
-				mu.Unlock()
+			safeCopy := *item
+			videoMap[id] = &safeCopy
+			if entityMode != feedEntityCacheModeRedis && entityMode != feedEntityCacheModeMySQL {
 				localcache.Set(localcache.NamespaceVideoEntity, localcache.VideoEntityKey(safeCopy.ID), safeCopy, 5*time.Second)
 			}
-		}(id)
+		}
 	}
-	wg.Wait()
 	return buildOrderedResult(videoIDs, videoMap), nil
 }
 
@@ -188,7 +216,21 @@ func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore ti
 	fetchLimit := candidateLimit(limit)
 	cursor := buildFeedTimeCursor(latestBefore, latestIDBefore)
 
-	baseVideos, nextCursor, err := f.loadLatestCandidates(ctx, fetchLimit, cursor)
+	sourceMode, _ := ctx.Value(feedSourceModeKey{}).(string)
+	sourceMode = normalizeFeedSourceMode(sourceMode)
+
+	var (
+		baseVideos []*video.Video
+		nextCursor *feedTimeCursor
+		err        error
+	)
+	switch sourceMode {
+	case feedSourceModeMySQL:
+		baseVideos, err = f.repo.ListLatest(ctx, fetchLimit, cursorTime(cursor), cursorID(cursor))
+		nextCursor = nextCursorFromVideos(baseVideos)
+	default:
+		baseVideos, nextCursor, err = f.loadLatestCandidates(ctx, fetchLimit, cursor)
+	}
 	if err != nil {
 		return ListLatestResponse{}, err
 	}
@@ -527,24 +569,29 @@ func (f *FeedService) applyExposureFilter(ctx context.Context, videos []*video.V
 		return videos[:limit]
 	}
 
+	now := time.Now().UTC()
+	key := exposureBloomKey(viewerKey, now)
+	seenMap, err := f.exposureSeenBatch(ctx, key, viewerKey, videos)
+	if err != nil {
+		seenMap = map[uint]bool{}
+	}
+
 	selected := make([]*video.Video, 0, minInt(limit, len(videos)))
+	selectedIDs := make([]uint, 0, minInt(limit, len(videos)))
 	for _, item := range videos {
 		if item == nil {
 			continue
 		}
-		seen, err := f.exposureSeen(ctx, viewerKey, item.ID)
-		if err != nil {
-			seen = false
-		}
-		if seen {
+		if seenMap[item.ID] {
 			continue
 		}
 		selected = append(selected, item)
-		_ = f.markExposure(ctx, viewerKey, item.ID)
+		selectedIDs = append(selectedIDs, item.ID)
 		if len(selected) == limit {
 			break
 		}
 	}
+	_ = f.markExposureBatch(ctx, key, viewerKey, selectedIDs)
 
 	return selected
 }
@@ -558,6 +605,38 @@ func normalizeFeedSortMode(mode string) string {
 	default:
 		return feedSortLatest
 	}
+}
+
+func normalizeFeedSourceMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case feedSourceModeTimeline:
+		return feedSourceModeTimeline
+	case feedSourceModeMySQL:
+		return feedSourceModeMySQL
+	default:
+		return feedSourceModeAuto
+	}
+}
+
+func normalizeFeedEntityCacheMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case feedEntityCacheModeLocal:
+		return feedEntityCacheModeLocal
+	case feedEntityCacheModeRedis:
+		return feedEntityCacheModeRedis
+	case feedEntityCacheModeMySQL:
+		return feedEntityCacheModeMySQL
+	default:
+		return feedEntityCacheModeAuto
+	}
+}
+
+func WithFeedSourceMode(ctx context.Context, mode string) context.Context {
+	return context.WithValue(ctx, feedSourceModeKey{}, normalizeFeedSourceMode(mode))
+}
+
+func WithFeedEntityCacheMode(ctx context.Context, mode string) context.Context {
+	return context.WithValue(ctx, feedEntityCacheModeKey{}, normalizeFeedEntityCacheMode(mode))
 }
 
 func candidateLimit(limit int) int {
@@ -676,6 +755,18 @@ func buildOrderedResult(orderedIDs []uint, dataMap map[uint]*video.Video) []*vid
 		}
 	}
 	return res
+}
+
+func buildVideoEntityBatchSingleflightKey(ids []uint) string {
+	if len(ids) == 0 {
+		return "sf:entity:batch:"
+	}
+
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, strconv.FormatUint(uint64(id), 10))
+	}
+	return "sf:entity:batch:" + strings.Join(parts, ",")
 }
 
 func buildFeedTimeCursor(ts time.Time, id uint) *feedTimeCursor {
@@ -911,34 +1002,66 @@ func filterVideosByCursor(videos []*video.Video, cursor *feedTimeCursor) []*vide
 	return filtered
 }
 
-func (f *FeedService) exposureSeen(ctx context.Context, viewerKey string, videoID uint) (bool, error) {
-	opCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+func (f *FeedService) exposureSeenBatch(ctx context.Context, key string, viewerKey string, videos []*video.Video) (map[uint]bool, error) {
+	seenMap := make(map[uint]bool, len(videos))
+	if f.rediscache == nil || key == "" || len(videos) == 0 {
+		return seenMap, nil
+	}
+
+	type exposureCandidate struct {
+		videoID uint
+		offsets []int64
+	}
+
+	candidates := make([]exposureCandidate, 0, len(videos))
+	flatOffsets := make([]int64, 0, len(videos)*len(exposureBloomSeeds))
+	for _, item := range videos {
+		if item == nil {
+			continue
+		}
+		offsets := exposureBloomOffsetsForViewer(viewerKey, item.ID)
+		candidates = append(candidates, exposureCandidate{
+			videoID: item.ID,
+			offsets: offsets,
+		})
+		flatOffsets = append(flatOffsets, offsets...)
+	}
+
+	opCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
 
-	key := exposureBloomKey(viewerKey, time.Now().UTC())
-	for _, offset := range exposureBloomOffsets(viewerKey, videoID) {
-		bit, err := f.rediscache.GetBit(opCtx, key, offset)
-		if err != nil {
-			return false, err
-		}
-		if bit == 0 {
-			return false, nil
-		}
+	bits, err := f.rediscache.GetBits(opCtx, key, flatOffsets)
+	if err != nil {
+		return nil, err
 	}
-	return true, nil
+
+	idx := 0
+	for _, candidate := range candidates {
+		seen := true
+		for range candidate.offsets {
+			if bits[idx] == 0 {
+				seen = false
+			}
+			idx++
+		}
+		seenMap[candidate.videoID] = seen
+	}
+	return seenMap, nil
 }
 
-func (f *FeedService) markExposure(ctx context.Context, viewerKey string, videoID uint) error {
-	opCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
-	defer cancel()
-
-	key := exposureBloomKey(viewerKey, time.Now().UTC())
-	for _, offset := range exposureBloomOffsets(viewerKey, videoID) {
-		if err := f.rediscache.SetBit(opCtx, key, offset, 1); err != nil {
-			return err
-		}
+func (f *FeedService) markExposureBatch(ctx context.Context, key string, viewerKey string, videoIDs []uint) error {
+	if f.rediscache == nil || key == "" || len(videoIDs) == 0 {
+		return nil
 	}
-	return f.rediscache.Expire(opCtx, key, exposureBloomTTL)
+
+	offsets := make([]int64, 0, len(videoIDs)*len(exposureBloomSeeds))
+	for _, videoID := range videoIDs {
+		offsets = append(offsets, exposureBloomOffsetsForViewer(viewerKey, videoID)...)
+	}
+
+	opCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	return f.rediscache.SetBitsWithExpire(opCtx, key, offsets, 1, exposureBloomTTL)
 }
 
 func exposureBloomKey(viewerKey string, now time.Time) string {
@@ -946,6 +1069,10 @@ func exposureBloomKey(viewerKey string, now time.Time) string {
 }
 
 func exposureBloomOffsets(viewerKey string, videoID uint) []int64 {
+	return exposureBloomOffsetsForViewer(viewerKey, videoID)
+}
+
+func exposureBloomOffsetsForViewer(viewerKey string, videoID uint) []int64 {
 	base := fmt.Sprintf("%s:%d", viewerKey, videoID)
 	offsets := make([]int64, 0, len(exposureBloomSeeds))
 	for _, seed := range exposureBloomSeeds {

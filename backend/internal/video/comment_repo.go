@@ -49,3 +49,14 @@ func (r *CommentRepository) GetByID(ctx context.Context, id uint) (*Comment, err
 	}
 	return &comment, nil
 }
+
+func (r *CommentRepository) GetByClientToken(ctx context.Context, clientToken string) (*Comment, error) {
+	var comment Comment
+	if err := r.db.WithContext(ctx).Where("client_token = ?", clientToken).First(&comment).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &comment, nil
+}

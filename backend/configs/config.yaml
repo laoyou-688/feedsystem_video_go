@@ -11,14 +11,14 @@ database:
 redis:
   host: localhost
   port: 6379
-  password: 
+  password: "123456"
   db: 0
 
 rabbitmq:
   host: localhost
   port: 5672
-  username: root
-  password: 123456
+  username: admin
+  password: password123
 
 canal:
   enabled: false
@@ -28,9 +28,12 @@ feed:
   following_fanout_threshold: 2000
   active_follower_window_hours: 72
   following_pull_cache_ttl_seconds: 30
-  
+
 observability:
   pprof:
     enabled: true
     api_addr: localhost:6060
     worker_addr: localhost:6061
+  metrics:
+    enabled: true
+    path: /metrics

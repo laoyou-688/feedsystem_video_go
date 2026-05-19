@@ -3,6 +3,8 @@ package redis
 import (
 	"context"
 	"time"
+
+	goredis "github.com/redis/go-redis/v9"
 )
 
 func (c *Client) GetBytes(ctx context.Context, key string) ([]byte, error) {
@@ -56,4 +58,48 @@ func (c *Client) GetBit(ctx context.Context, key string, offset int64) (int64, e
 		return 0, nil
 	}
 	return c.rdb.GetBit(ctx, key, offset).Result()
+}
+
+func (c *Client) GetBits(ctx context.Context, key string, offsets []int64) ([]int64, error) {
+	if c == nil || c.rdb == nil {
+		return make([]int64, len(offsets)), nil
+	}
+	if len(offsets) == 0 {
+		return []int64{}, nil
+	}
+
+	pipe := c.rdb.Pipeline()
+	cmds := make([]*goredis.IntCmd, len(offsets))
+	for i, offset := range offsets {
+		cmds[i] = pipe.GetBit(ctx, key, offset)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != goredis.Nil {
+		return nil, err
+	}
+
+	results := make([]int64, len(offsets))
+	for i, cmd := range cmds {
+		v, err := cmd.Result()
+		if err != nil && err != goredis.Nil {
+			return nil, err
+		}
+		results[i] = v
+	}
+	return results, nil
+}
+
+func (c *Client) SetBitsWithExpire(ctx context.Context, key string, offsets []int64, value int, ttl time.Duration) error {
+	if c == nil || c.rdb == nil || len(offsets) == 0 {
+		return nil
+	}
+
+	pipe := c.rdb.Pipeline()
+	for _, offset := range offsets {
+		pipe.SetBit(ctx, key, offset, value)
+	}
+	if ttl > 0 {
+		pipe.Expire(ctx, key, ttl)
+	}
+	_, err := pipe.Exec(ctx)
+	return err
 }

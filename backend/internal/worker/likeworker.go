@@ -7,17 +7,20 @@ import (
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
 	"feedsystem_video_go/internal/video"
-	amqp "github.com/rabbitmq/amqp091-go"
 	"log"
 	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+const likeMaxRetryCount = 3
+
 type LikeWorker struct {
-	ch     *amqp.Channel
-	cache  *rediscache.Client
-	likes  *video.LikeRepository
-	videos *video.VideoRepository
-	queue  string
+	ch           *amqp.Channel
+	cache        *rediscache.Client
+	likes        *video.LikeRepository
+	videos       *video.VideoRepository
+	queue        string
 	localCacheMQ *rabbitmq.LocalCacheMQ
 }
 
@@ -61,8 +64,7 @@ func (w *LikeWorker) Run(ctx context.Context) error {
 
 func (w *LikeWorker) handleDelivery(ctx context.Context, d amqp.Delivery) {
 	if err := w.process(ctx, d.Body); err != nil {
-		log.Printf("like worker: failed to process message: %v", err)
-		_ = d.Nack(false, true)
+		w.handleFailure(ctx, d, err)
 		return
 	}
 	_ = d.Ack(false)
@@ -71,25 +73,34 @@ func (w *LikeWorker) handleDelivery(ctx context.Context, d amqp.Delivery) {
 func (w *LikeWorker) process(ctx context.Context, body []byte) error {
 	var evt rabbitmq.LikeEvent
 	if err := json.Unmarshal(body, &evt); err != nil {
-		// 解析事件失败，直接丢弃
 		return nil
 	}
 	if evt.UserID == 0 || evt.VideoID == 0 {
 		return nil
 	}
-	claimed, err := claimEvent(ctx, w.cache, "like", evt.EventID)
-	if err == nil && !claimed {
+
+	done, err := hasProcessedEvent(ctx, w.cache, "like", evt.EventID)
+	if err == nil && done {
 		return nil
+	}
+	if err != nil {
+		return err
 	}
 
 	switch evt.Action {
 	case "like":
-		return w.applyLike(ctx, evt.UserID, evt.VideoID)
+		if err := w.applyLike(ctx, evt.UserID, evt.VideoID); err != nil {
+			return err
+		}
 	case "unlike":
-		return w.applyUnlike(ctx, evt.UserID, evt.VideoID)
+		if err := w.applyUnlike(ctx, evt.UserID, evt.VideoID); err != nil {
+			return err
+		}
 	default:
 		return nil
 	}
+
+	return markEventDone(ctx, w.cache, "like", evt.EventID)
 }
 
 func (w *LikeWorker) applyLike(ctx context.Context, userID, videoID uint) error {
@@ -148,4 +159,45 @@ func (w *LikeWorker) applyUnlike(ctx context.Context, userID, videoID uint) erro
 	}
 	video.PublishVideoCacheInvalidation(ctx, w.localCacheMQ, videoID)
 	return nil
+}
+
+func (w *LikeWorker) handleFailure(ctx context.Context, d amqp.Delivery, err error) {
+	retryCount := readRetryCount(d.Headers)
+	routingKey := d.RoutingKey
+	if routingKey == "" {
+		var evt rabbitmq.LikeEvent
+		if jsonErr := json.Unmarshal(d.Body, &evt); jsonErr == nil {
+			if derived, routeErr := rabbitmq.LikeRoutingKey(evt.Action); routeErr == nil {
+				routingKey = derived
+			}
+		}
+	}
+
+	headers := copyHeaders(d.Headers)
+	headers["x-retry-count"] = retryCount + 1
+	headers["x-last-error"] = err.Error()
+	headers["x-last-failed-at"] = time.Now().UTC().Format(time.RFC3339)
+
+	publishCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	if retryCount >= likeMaxRetryCount {
+		if dlqErr := rabbitmq.PublishLikeDLQ(publishCtx, w.ch, routingKey, d.Body, headers); dlqErr != nil {
+			log.Printf("like worker: failed to move message to dlq: event_routing=%s retry_count=%d err=%v original_err=%v", routingKey, retryCount, dlqErr, err)
+			_ = d.Nack(false, true)
+			return
+		}
+		log.Printf("like worker: moved message to dlq: routing=%s retry_count=%d err=%v", routingKey, retryCount, err)
+		_ = d.Ack(false)
+		return
+	}
+
+	if retryErr := rabbitmq.PublishLikeRetry(publishCtx, w.ch, routingKey, d.Body, headers); retryErr != nil {
+		log.Printf("like worker: failed to publish retry message: routing=%s retry_count=%d err=%v original_err=%v", routingKey, retryCount, retryErr, err)
+		_ = d.Nack(false, true)
+		return
+	}
+
+	log.Printf("like worker: scheduled retry: routing=%s retry_count=%d err=%v", routingKey, retryCount+1, err)
+	_ = d.Ack(false)
 }

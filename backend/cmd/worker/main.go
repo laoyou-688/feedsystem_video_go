@@ -229,69 +229,9 @@ func declarePopularityTopology(ch *amqp.Channel) error {
 }
 
 func declareLikeTopology(ch *amqp.Channel) error {
-	if err := ch.ExchangeDeclare(
-		likeExchange,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-
-	q, err := ch.QueueDeclare(
-		likeQueue,
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return err
-	}
-
-	return ch.QueueBind(
-		q.Name,
-		likeBindingKey,
-		likeExchange,
-		false,
-		nil,
-	)
+	return rabbitmq.DeclareLikeTopology(ch)
 }
 
 func declareCommentTopology(ch *amqp.Channel) error {
-	if err := ch.ExchangeDeclare(
-		commentExchange,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-
-	q, err := ch.QueueDeclare(
-		commentQueue,
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return err
-	}
-
-	return ch.QueueBind(
-		q.Name,
-		commentBindingKey,
-		commentExchange,
-		false,
-		nil,
-	)
+	return rabbitmq.DeclareCommentTopology(ch)
 }

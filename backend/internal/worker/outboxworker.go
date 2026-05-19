@@ -43,11 +43,32 @@ func StartOutboxPoller(db *gorm.DB, tmq *rabbitmq.TimelineMQ) {
 			}
 
 			for _, msg := range messages {
-				err := tmq.PublishVideo(context.Background(), msg.VideoID, msg.AuthorID, msg.CreateTime)
+				var err error
+				switch msg.EventType {
+				case "video_published":
+					err = tmq.PublishVideo(context.Background(), msg.VideoID, msg.AuthorID, msg.CreateTime)
+				case "social_follow":
+					smq, socialErr := rabbitmq.NewSocialMQ(tmq.RabbitMQ)
+					if socialErr != nil {
+						err = socialErr
+					} else {
+						err = smq.Follow(context.Background(), msg.FollowerID, msg.VloggerID)
+					}
+				case "social_unfollow":
+					smq, socialErr := rabbitmq.NewSocialMQ(tmq.RabbitMQ)
+					if socialErr != nil {
+						err = socialErr
+					} else {
+						err = smq.UnFollow(context.Background(), msg.FollowerID, msg.VloggerID)
+					}
+				default:
+					db.Delete(&msg)
+					continue
+				}
 				if err == nil {
 					db.Delete(&msg)
 				} else {
-					log.Printf("publish timeline message failed: video_id=%d err=%v", msg.VideoID, err)
+					log.Printf("publish outbox message failed: event_type=%s video_id=%d follower_id=%d vlogger_id=%d err=%v", msg.EventType, msg.VideoID, msg.FollowerID, msg.VloggerID, err)
 				}
 			}
 		}

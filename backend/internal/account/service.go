@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"feedsystem_video_go/internal/auth"
+	"feedsystem_video_go/internal/localcache"
+	"feedsystem_video_go/internal/middleware/rabbitmq"
 	"fmt"
 	"log"
 	"time"
@@ -18,6 +20,7 @@ import (
 type AccountService struct {
 	accountRepository *AccountRepository
 	cache             *rediscache.Client
+	localCacheMQ      *rabbitmq.LocalCacheMQ
 }
 
 var (
@@ -25,8 +28,12 @@ var (
 	ErrNewUsernameRequired = errors.New("new_username is required")
 )
 
-func NewAccountService(accountRepository *AccountRepository, cache *rediscache.Client) *AccountService {
-	return &AccountService{accountRepository: accountRepository, cache: cache}
+func NewAccountService(accountRepository *AccountRepository, cache *rediscache.Client, localCacheMQ *rabbitmq.LocalCacheMQ) *AccountService {
+	return &AccountService{
+		accountRepository: accountRepository,
+		cache:             cache,
+		localCacheMQ:      localCacheMQ,
+	}
 }
 
 func (as *AccountService) CreateAccount(ctx context.Context, account *Account) error {
@@ -51,7 +58,8 @@ func (as *AccountService) Rename(ctx context.Context, accountID uint, newUsernam
 		return "", err
 	}
 
-	if err := as.accountRepository.RenameWithToken(ctx, accountID, newUsername, token); err != nil {
+	videoIDs, err := as.accountRepository.RenameWithToken(ctx, accountID, newUsername, token)
+	if err != nil {
 		var mysqlErr *mysql.MySQLError
 		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
 			return "", ErrUsernameTaken
@@ -61,6 +69,7 @@ func (as *AccountService) Rename(ctx context.Context, accountID uint, newUsernam
 		}
 		return "", err
 	}
+	as.invalidateRenamedVideoCaches(ctx, videoIDs)
 	if as.cache != nil {
 		cacheCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 		defer cancel()
@@ -70,6 +79,44 @@ func (as *AccountService) Rename(ctx context.Context, accountID uint, newUsernam
 		}
 	}
 	return token, nil
+}
+
+func (as *AccountService) invalidateRenamedVideoCaches(ctx context.Context, videoIDs []uint) {
+	if len(videoIDs) == 0 {
+		return
+	}
+
+	for _, videoID := range videoIDs {
+		localcache.Delete(localcache.NamespaceVideoEntity, localcache.VideoEntityKey(videoID))
+		localcache.Delete(localcache.NamespaceVideoDetail, localcache.VideoDetailKey(videoID))
+	}
+
+	if as.cache != nil {
+		keys := make([]string, 0, len(videoIDs)*2)
+		for _, videoID := range videoIDs {
+			keys = append(keys,
+				fmt.Sprintf("video:entity:%d", videoID),
+				fmt.Sprintf("video:detail:id=%d", videoID),
+			)
+		}
+
+		cacheCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		defer cancel()
+		if err := as.cache.DelMany(cacheCtx, keys...); err != nil {
+			log.Printf("failed to clear renamed video caches: %v", err)
+		}
+	}
+
+	if as.localCacheMQ != nil {
+		for _, videoID := range videoIDs {
+			if err := as.localCacheMQ.PublishInvalidate(ctx, localcache.NamespaceVideoEntity, localcache.VideoEntityKey(videoID)); err != nil {
+				log.Printf("failed to publish video entity invalidation: %v", err)
+			}
+			if err := as.localCacheMQ.PublishInvalidate(ctx, localcache.NamespaceVideoDetail, localcache.VideoDetailKey(videoID)); err != nil {
+				log.Printf("failed to publish video detail invalidation: %v", err)
+			}
+		}
+	}
 }
 
 func (as *AccountService) ChangePassword(ctx context.Context, username, oldPassword, newPassword string) error {

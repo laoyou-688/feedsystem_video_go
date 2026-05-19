@@ -34,3 +34,6 @@ observability:
     enabled: false
     api_addr: localhost:6060
     worker_addr: localhost:6061
+  metrics:
+    enabled: true
+    path: /metrics
