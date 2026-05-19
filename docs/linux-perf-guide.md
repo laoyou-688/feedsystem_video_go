@@ -84,6 +84,16 @@ HOST=http://127.0.0.1:8080 bash scripts/perf/run_feed_list_latest_perf.sh
 2. `timeline + mysql entity`
 3. `mysql + mysql`
 
+默认是匿名基线压测，不会带 `X-Feed-Session`，这样可以先测 Feed 拉取、时间线和实体缓存本身的性能。
+
+如果你还想单独观察“曝光去重”带来的额外成本，再加一个固定 session：
+
+```bash
+HOST=http://127.0.0.1:8080 \
+FEED_SESSION=perf-session-001 \
+bash scripts/perf/run_feed_list_latest_perf.sh
+```
+
 ## 9. 压测时同步观察什么
 
 ### 9.1 接口指标

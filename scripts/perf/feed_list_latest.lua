@@ -5,7 +5,11 @@ if limit == nil or limit == "" then
 end
 wrk.body   = string.format('{"limit":%s}', limit)
 wrk.headers["Content-Type"] = "application/json"
-wrk.headers["X-Feed-Session"] = "perf-session-001"
+
+local feed_session = os.getenv("FEED_SESSION")
+if feed_session ~= nil and feed_session ~= "" then
+  wrk.headers["X-Feed-Session"] = feed_session
+end
 
 local source_mode = os.getenv("FEED_SOURCE_MODE")
 if source_mode ~= nil and source_mode ~= "" then
